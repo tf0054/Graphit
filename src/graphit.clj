@@ -8,48 +8,46 @@
            (java.io BufferedReader PrintWriter File)
            (java.text NumberFormat DecimalFormat SimpleDateFormat)
            (java.util Date)
-           (javax.swing JFrame JPanel JTextField BoxLayout Box
-                        JLabel JMenuItem JOptionPane JButton SwingUtilities
-                        SwingConstants JCheckBox BorderFactory JSeparator)
            (java.net ServerSocket Socket InetSocketAddress)
-           (java.awt.event ActionListener ItemListener ItemEvent WindowAdapter)
-           (java.awt BasicStroke Dimension Color BorderLayout FlowLayout)
+           (java.awt.event ItemEvent)
+           (java.awt BasicStroke Dimension Color)
            (java.nio ByteBuffer)
            (java.nio.channels Selector ServerSocketChannel SelectionKey))
-  (:use clojure.java.io
-        clojure.tools.cli command_line)
-  (:require tabpane)
-
+  (:use clojure.java.io)
+  (:require tabpane
+            [clojure.tools.cli :refer [parse-opts]]
+            [seesaw.border :as sb] 
+            [seesaw.core :as s])
   (:gen-class))
 
 
 ;; Thread-shared vars
-(def *redraw-delay-ms* (atom 10000))
+(def ^:dynamic *redraw-delay-ms* (atom 10000))
 
-(def *data-gatherer* (agent []))
-(def *expire-threshold* (atom (Integer/MAX_VALUE)))
-(def *max-readings* (atom 120))
-(def *graphs-per-page* (atom 4))
+(def ^:dynamic *data-gatherer* (agent []))
+(def ^:dynamic *expire-threshold* (atom (Integer/MAX_VALUE)))
+(def ^:dynamic *max-readings* (atom 120))
+(def ^:dynamic *graphs-per-page* (atom 4))
 
-(def *tab-cycle-active* (atom false))
-(def *tab-cycle-delay* (atom 30))
+(def ^:dynamic *tab-cycle-active* (atom false))
+(def ^:dynamic *tab-cycle-delay* (atom 30))
 
-(def *graphs* (atom {}))
-(def *hide-legend* (atom nil))
+(def ^:dynamic *graphs* (atom {}))
+(def ^:dynamic *hide-legend* (atom nil))
 
-(def *datastream-listeners* (agent #{}))
+(def ^:dynamic *datastream-listeners* (agent #{}))
 
 
 ;; Objects used for interruptible sleeps
-(def *plot-alarm* (Object.))
-(def *tab-cycle-alarm* (Object.))
+(def ^:dynamic *plot-alarm* (Object.))
+(def ^:dynamic *tab-cycle-alarm* (Object.))
 
 
 ;;; Misc utilities
 
 (defn interruptible-sleep [ms alarm]
   (locking alarm
-    (if (> ms 0)
+    (if (pos? ms)
       (.wait alarm ms)
       (.wait alarm))))
 
@@ -60,8 +58,10 @@
 
 ;;; Ah, swing...
 
-(def *window*
-     {:frame (JFrame.)
+(def ^:dynamic *window*
+     {:frame (s/frame :title "Graphit"
+                      :minimum-size [800 :by 600]
+                      :on-close :exit)
       :panel (tabpane/tabpane *graphs-per-page*)})
 
 
@@ -264,21 +264,9 @@
   (hide-graph graphname true)
   (swap! *graphs* dissoc graphname))
 
-
-(defn item-listener [fn]
-  (proxy [ItemListener] []
-    (itemStateChanged [e] (fn e))))
-
-(defn action-listener [fn]
-  (proxy [ActionListener] []
-    (actionPerformed [e] (try (fn e)
-                          (catch Exception _)))))
-
-
 (defn menu-item [label f]
-  (doto (JMenuItem. label)
-    (.setActionCommand "PROPERTIES")
-    (.addActionListener (action-listener f))))
+  (s/menu-item :text label
+               :listen [:action f]))
 
 
 ;; A terrible hack ;o)
@@ -299,10 +287,11 @@
       (.addSeparator)
       (.add (menu-item "Delete this graph"
                        (fn [_]
-                         (when (= (JOptionPane/showConfirmDialog
+                         (when (s/confirm
                                    (:frame *window*)
-                                   "Really delete?")
-                                  JOptionPane/YES_OPTION)
+                                   "Really delete?"
+                                 :option-type :yes-no
+                                 :type :warning)
                            (remove-graph name))))))))
 
 
@@ -332,9 +321,8 @@
 
 
 (defn do-plot [values]
-  (SwingUtilities/invokeLater
-   (fn []
-     (print-exceptions
+  (s/invoke-later
+    (print-exceptions
 
       (doseq [{:keys [graph time line value]} values]
 
@@ -374,7 +362,7 @@
         (when-let [series (first (-> graph :lines vals))]
           (.fireSeriesChanged series)))
 
-      (send-off *data-gatherer* do-plot))))
+      (send-off *data-gatherer* do-plot)))
   (interruptible-sleep @*redraw-delay-ms* *plot-alarm*)
   [])
 
@@ -434,94 +422,81 @@
      (System/exit 1))))
 
 
-
-
-(defn separator []
-  (doto (JPanel.)
-    (.add (Box/createHorizontalStrut 5))
-    (.add (doto (JSeparator. SwingConstants/VERTICAL)
-            (.setPreferredSize (Dimension. 1 10))))
-    (.add (Box/createHorizontalStrut 5))))
-
-
-(defn make-control-panel []
-  (doto (JPanel.)
-    ;; Redraw rate adjustment
-    (.add (JLabel. "Redraw rate:"))
-    (.add (doto (JTextField.)
-
-            (.addActionListener (action-listener
-                                 #(set-rate
+(defn make-control-panel 
+  "creates the settings panel that is rendered above the graphs."
+  []
+  (s/flow-panel
+    :align :left
+    :items [(s/label "Redraw rate:")
+            (s/text
+              :text (str @*redraw-delay-ms*)
+              :columns 6
+              :listen [:action (fn [evt]
+                                 (set-rate
                                    *redraw-delay-ms*
-                                   (Integer. (.getActionCommand %))
-                                   *plot-alarm*)))
-            (.setColumns 6)
-            (.setText (str @*redraw-delay-ms*))))
-    (.add (JLabel. "ms"))
+                                   (Integer/parseInt (.getActionCommand evt))
+                                   *plot-alarm*))])
+            (s/label "ms")
 
-    (.add (separator))
+            (s/separator :size [1 :by 20])
 
-    ;; Tab cycling adjustment
-    (.add (doto (JCheckBox.)
-            (.addItemListener
-             (item-listener
-              #(try
-                (reset! *tab-cycle-active*
-                        (= (.getStateChange %) ItemEvent/SELECTED))
-                (catch Exception _))))))
-    (.add (JLabel. "Cycle tabs every "))
-    (.add (doto (JTextField. nil (str @*tab-cycle-delay*) 3)
-            (.addActionListener
-             (action-listener
-              #(set-rate *tab-cycle-delay*
-                         (Integer. (.getActionCommand %))
-                         *tab-cycle-alarm*)))))
-    (.add (JLabel. " secs"))
+            ;; Tab cycling adjustment
+            (s/checkbox
+              :text "Cycle tabs every"
+              :listen [:item #(try
+                                (reset! *tab-cycle-active*
+                                        (= (.getStateChange %) ItemEvent/SELECTED))
+                                (catch Exception _)) ])
 
-    (.add (separator))
+            (s/text 
+              :text (str @*tab-cycle-delay*) 
+              :columns 3
+              :listen [:action (fn [evt]
+                                 (set-rate
+                                   *tab-cycle-delay*
+                                   (Integer/parseInt (.getActionCommand evt))
+                                   *tab-cycle-alarm*))])
+            (s/label " secs")
 
-    ;; Graphs per page
-    (.add (JLabel. "Show "))
-    (.add (doto (JTextField. nil (str @*graphs-per-page*) 3)
-            (.addActionListener
-             (action-listener
-              #(do
-                 (reset! *graphs-per-page*
-                         (Integer. (.getActionCommand %)))
-                 (tabpane/rebalance (:panel *window*)))))))
-    (.add (JLabel. " graphs/page"))
-    (.setLayout (doto (FlowLayout.)
-                  (.setAlignment FlowLayout/LEFT)))))
+            (s/separator :size [1 :by 20])
+
+            ;; Graphs per page
+            (s/label "Show ")
+            (s/text 
+              :text (str @*graphs-per-page*) 
+              :columns 3
+              :listen [:action (fn [evt]
+                                 (reset! *graphs-per-page*
+                                         (Integer. (.getActionCommand evt)))
+                                 (tabpane/rebalance (:panel *window*)))])
+            (s/label " graphs/page")]))
 
 
-(defn make-status-bar []
-  (doto (JPanel.)
-    (.setPreferredSize (Dimension. 15 33))
-    (.setBorder (BorderFactory/createEmptyBorder 5 5 5 5))
-    (.setLayout (BorderLayout.))
-    (.add (make-control-panel) BorderLayout/WEST)
-    (.add (doto (JButton. "Dump points")
-            (.addActionListener (action-listener
-                                 (fn [_]
-                                   (try (save-state)
-                                        (catch Exception _))))))
-          BorderLayout/EAST)))
+(defn make-status-bar 
+  "Creates the status bar that is rendered above the graphs, 
+  which contains the control panel and the dump points button"
+  []
+  (s/border-panel 
+    :west (make-control-panel)
+    :east (s/button :text "Dump points"
+                    :listen [:action (fn [_]
+                                       (try (save-state)
+                                            (catch Exception _)))])
+    :border (sb/empty-border :thickness 1) 
+    :size [15 :by 33]))
 
 
 (defn run-ui [geometry]
-  (SwingUtilities/invokeLater
-   (fn []
-     (.setLayout (.getContentPane (:frame *window*))
-                 (BorderLayout.))
-     (doto (:frame *window*)
-       (.addWindowListener
-        (proxy [WindowAdapter] []
-          (windowClosed [e] (save-state))))
-       (.setDefaultCloseOperation JFrame/EXIT_ON_CLOSE)
-       (.add (make-status-bar) BorderLayout/NORTH)
-       (.add (tabpane/get-panel (:panel *window*)))
-       (.setSize geometry)
-       (.setVisible true)))))
+  "initlises the ui content."
+  (s/invoke-later
+    (doto (:frame *window*)
+      (s/config! :content (s/border-panel
+                            :north (make-status-bar)
+                            :center (tabpane/get-panel (:panel *window*))))
+      ;does not work
+      ;(s/listen :window-closed (fn [_] (save-state)))
+      (s/config! :size geometry)
+      (s/show!))))
 
 
 (defn datastream-handler [port]
@@ -551,27 +526,74 @@
 (defn parse-geometry [s]
   (try
    (let [[w h] (map #(Integer/valueOf %) (.split s "[xX]"))]
-     (Dimension. w h))
+     [w :by h])
    (catch Exception _
-     (Dimension. 1280 1024))))
+     [1280 :by 1024])))
 
+(def cli-options
+  [[nil "--max-to-keep ARG" "Maximum points to keep per line."
+    :default 120
+    :parse-fn #(Integer/parseInt %)]
+
+   [nil "--expire-threshold ARG" "The number of points a line can fall behind other lines before being expired."
+    :default nil
+    :parse-fn #(Integer/parseInt %)]
+
+   [nil "--hide-legend" "Don't display the graph's legend."]
+
+   [nil "--graphs-per-page ARG" "Number of graphs per tabbed page."
+    :default 4
+    :parse-fn #(Integer/parseInt %)]
+
+   ["-p" "--port PORT" "Listen port"
+    :default 6666
+    :parse-fn #(Integer/parseInt %)
+    :validate [#(< 0 % 0x10000) "Must be a number between 0 and 65536"]]
+
+   [nil "--datastream-port PORT" "Data stream port"
+    :default nil
+    :parse-fn #(Integer/parseInt %)
+    :validate [#(< 0 % 0x10000) "Must be a number between 0 and 65536"]]
+
+   [nil "--redraw ARG" "Redraw ms."
+    :default 2000
+    :parse-fn #(Integer/parseInt %)]
+
+   [nil "--geometry WxH" "Window dimensions (WxH)"
+    :default [1280 :by 1024]
+    :parse-fn parse-geometry]
+
+   ["-h" "--help"]])
+
+(defn usage 
+  "generates the help text"
+  [options]
+  (clojure.string/join \newline ["A handy graphing thingy." 
+                                 options]))
+(defn error-msg [errors]
+  (str "Invalid arguments. Run with --help to see available arguments.\n\n"
+       (clojure.string/join \newline errors)))
+
+(defn exit [status msg]
+  (println msg)
+  (System/exit status))
 
 (defn -main [& args]
-  (with-command-line args
-    "A handy graphing thingy"
-    [[max-to-keep "Maximum points to keep per line" "120"]
-     [expire-threshold
-      "The number of points a line can fall behind other lines before being expired."
-      nil]
-     [hide-legend "Don't display the graph's legend"]
-     [graphs-per-page "Number of graphs per tabbed page" "4"]
-     [port "Listen port" "6666"]
-     [datastream-port "Data stream port" nil]
-     [redraw "Redraw ms" "2000"]
-     [geometry "Window dimensions (wxh)" "1280x1024"]]
+  (let [{:keys [errors options summary]} (parse-opts args cli-options)
+        {:keys [max-to-keep
+                expire-threshold
+                hide-legend 
+                graphs-per-page
+                port
+                datastream-port
+                redraw
+                geometry]}                options]
+    (cond
+      (:help options) (exit 0 (usage summary))
+      errors (exit 1 (error-msg errors)))    
 
     (.addShutdownHook (Runtime/getRuntime)
-                      (Thread. #(save-state)))
+                      (Thread. save-state))
 
     (set-rate *redraw-delay-ms* (Integer. redraw) *plot-alarm*)
     (when expire-threshold
@@ -590,4 +612,4 @@
        (when @*tab-cycle-active*
          (tabpane/cycle-tab (:panel *window*)))
        (interruptible-sleep (* @*tab-cycle-delay* 1000) *tab-cycle-alarm*)))
-    (run-ui (parse-geometry geometry))))
+    (run-ui geometry)))
